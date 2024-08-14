@@ -192,21 +192,21 @@ func (c *Client) Start(ctx context.Context, eventFn EventHandler, errorFn ErrorH
 
 // connect performs single connection to SSE endpoint.
 func (c *Client) connect(ctx context.Context, eventFn EventHandler) error {
-	c.HttpRequest.Header.Set("Cache-Control", "no-cache")
-	c.HttpRequest.Header.Set("Accept", "text/event-stream")
+	req := c.HttpRequest.Clone(ctx)
+	req.Header.Set("Cache-Control", "no-cache")
+	req.Header.Set("Accept", "text/event-stream")
 	if c.LastEventID != "" {
-		c.HttpRequest.Header.Set("Last-Event-ID", c.LastEventID)
+		req.Header.Set("Last-Event-ID", c.LastEventID)
 	}
 
 	for h, vs := range c.Headers {
 		for _, v := range vs {
-			c.HttpRequest.Header.Add(h, v)
+			req.Header.Add(h, v)
 		}
 	}
 
-	resp, err := c.HTTPClient.Do(c.HttpRequest)
+	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
-		// silently ignore connection errors and reconnect.
 		return errStreamConn
 	}
 	c.StatusCode = resp.StatusCode
@@ -215,33 +215,37 @@ func (c *Client) connect(ctx context.Context, eventFn EventHandler) error {
 
 	switch resp.StatusCode {
 	case http.StatusOK:
-		// we do not support BOM in sse streams, or \r line separators.
 		r := bufio.NewReader(resp.Body)
 
 		for {
-			event, err := c.parseEvent(r)
-			if err != nil {
-				return err
-			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+				event, err := c.parseEvent(r)
+				if err != nil {
+					if err == io.EOF {
+						return nil // Reconnect silently
+					}
+					return err
+				}
 
-			// ignore empty events
-			if len(event.Data) == 0 {
-				continue
-			}
+				// Ignore empty events
+				if len(event.Data) == 0 {
+					continue
+				}
 
-			if err := eventFn(event); err != nil {
-				return err
+				if err := eventFn(event); err != nil {
+					return err
+				}
 			}
 		}
 	case http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
 		if c.VerboseStatusCodes {
 			return fmt.Errorf("bad response status code %d", resp.StatusCode)
 		}
-		c.VerboseStatusCodes = true
-		// reconnect without logging an error.
 		return errStreamConn
 	default:
-		// trigger a reconnect and output an error.
 		return fmt.Errorf("bad response status code %d", resp.StatusCode)
 	}
 }
